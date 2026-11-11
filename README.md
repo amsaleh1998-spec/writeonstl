@@ -31,6 +31,27 @@ Everything runs locally in the browser, so your files are never uploaded anywher
 - Apply several texts one after another, with **Undo** (Ctrl/⌘+Z) and **Reset**, then **Download STL**.
   The downloaded file is named after the model and the texts you added, e.g. `plate-Hello-Lot_7.stl`. Spaces and line breaks become `_`, and characters that file names can't contain are removed.
 
+## Aligner cases (numbering every stage)
+
+For clear-aligner production, you can label a whole case in one go. The app reads the export of an aligner program, such as 3Shape Clear Aligner Studio:
+
+```
+<case>_Subsetup1/Maxillary.stl
+<case>_Subsetup1/Maxillary_with_attachments.stl   ← attachment template (stage 1)
+<case>_Subsetup1/Mandibular.stl
+<case>_Subsetup1/Mandibular_with_attachments.stl
+<case>_Subsetup2/Maxillary.stl
+…
+ClearAlignerProductionResources.xml
+```
+
+1. **Open the case.** Click **Open aligner export folder…** and pick the export folder (or a folder above it), or drop the folder onto the page. ZIPs of the export also work, even split into several parts: use *Open STL…* or drop them. A subsetup folder may hold only one jaw.
+2. **Place the number on stage 1.** In the **Aligner case** panel, pick *Maxillary* or *Mandibular* and *Number*, then click the model where the number should go. The label text is a template, where `{n}` becomes the subsetup number, so `U{n}` gives `U1`, `U2` and so on. All the models share one coordinate system, so the number lands on the same spot of every stage. Step through the stages (‹ ›) to check each one.
+3. **Place the T.** Choose *T on attachments* and click where the T should go on the stage 1 model with attachments. The number appears there in purple so the two labels don't overlap. *Also number the attachment models* (on by default) gives that model its number as well.
+4. **Label everything.** Repeat for the other jaw, then click **Label all models & download ZIP**. Every model is labelled with the current style (font, size, emboss or engrave, depth, and so on). The ZIP keeps the export's folder and file names, and the original XML, so it can go straight to production.
+
+The panel shows what is still missing. A warning appears when a label crosses an edge (for example the rim of a hollowed base) or hangs off the model. After processing, a note lists any models where that happened.
+
 Units are assumed to be millimetres, which is the convention for 3D-printing STLs.
 
 ## Development
@@ -62,6 +83,7 @@ index.html            UI markup
 src/main.js           three.js viewer, interaction, UI wiring
 src/viewControls.js   camera control (free rotate, flick, zoom, pan, rotation centre)
 src/spacemouse.js     3Dconnexion SpaceMouse input (WebHID / game controller)
+src/aligner.js        recognising aligner exports (stages, jaws, attachment models)
 src/text.js           font → 2D outlines
 src/geom.js           solid modelling (Manifold), STL writer
 src/style.css         styles (light/dark)

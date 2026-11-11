@@ -113,8 +113,9 @@ export function buildTextSolid(o) {
   // from the tangent plane at the click point.
   const step = Math.max(o.refine, 0.05);
   const polys = cs.toPolygons();
-  let minH = Infinity, maxH = -Infinity, samples = 0, misses = 0;
+  let minH = Infinity, maxH = -Infinity, samples = 0, misses = 0, jumps = 0;
   for (const poly of polys) {
+    let prev = null;
     for (let i = 0; i < poly.length; i++) {
       const a = poly[i], b = poly[(i + 1) % poly.length];
       const n = Math.max(1, Math.ceil(Math.hypot(b[0] - a[0], b[1] - a[1]) / step));
@@ -122,7 +123,10 @@ export function buildTextSolid(o) {
         const t = k / n;
         const h = o.heightAt(a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t);
         samples++;
-        if (h === null) { misses++; continue; }
+        if (h === null) { misses++; prev = null; continue; }
+        // a jump much steeper than 70° between neighbouring samples = an edge or step
+        if (prev !== null && Math.abs(h - prev) > 3 * step + 0.05) jumps++;
+        prev = h;
         if (h < minH) minH = h;
         if (h > maxH) maxH = h;
       }
@@ -171,7 +175,12 @@ export function buildTextSolid(o) {
 
   const placed = solid.transform(o.matrix);
   solid.delete();
-  return { solid: placed, conformed: conform, offSurface: samples > 0 && misses / samples > 0.002 };
+  return {
+    solid: placed,
+    conformed: conform,
+    offSurface: samples > 0 && misses / samples > 0.002,
+    crossesEdge: jumps > 0,
+  };
 }
 
 /**
@@ -224,7 +233,31 @@ export function booleanOp(model, tool, mode) {
     result.delete();
     throw new Error('Boolean failed: ' + status);
   }
-  return result;
+  return dropSlivers(result);
+}
+
+/**
+ * Remove stray shells with no real volume (inverted or paper-thin slivers). They appear
+ * when a label folds over an edge, and slicers would otherwise flag them. Takes
+ * ownership of `man` and returns the cleaned manifold (or `man` itself).
+ */
+export function dropSlivers(man, minVolume = 1e-3) {
+  const { Manifold } = M();
+  const parts = man.decompose();
+  if (parts.length <= 1) {
+    for (const p of parts) p.delete();
+    return man;
+  }
+  const keep = parts.filter((p) => p.volume() > minVolume);
+  for (const p of parts) if (!keep.includes(p)) p.delete();
+  if (keep.length === parts.length || !keep.length) {
+    for (const p of keep) p.delete();
+    return man;
+  }
+  const res = Manifold.compose(keep);
+  for (const p of keep) p.delete();
+  man.delete();
+  return res;
 }
 
 /** Binary STL from a non-indexed xyz triangle soup. */

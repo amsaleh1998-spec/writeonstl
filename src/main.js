@@ -10,6 +10,8 @@ import {
 import { parseFont, fontDisplayName, textToContours } from './text.js';
 import { ViewControls } from './viewControls.js';
 import { SpaceMouse } from './spacemouse.js';
+import { unzip, zip } from 'fflate';
+import { parseAlignerFiles, labelText, firstStage, findModel, JAW_LABEL } from './aligner.js';
 
 THREE.Mesh.prototype.raycast = acceleratedRaycast;
 
@@ -45,6 +47,11 @@ const DEFAULTS = {
   mirror: false,
   embed: 0.4,
   quality: 3,
+  // aligner cases
+  batchTemplate: '{n}',
+  batchT: 'T',
+  batchNumberAttach: true,
+  batchSized: false,
 };
 const QUALITY_TOLERANCE = { 1: 0.1, 2: 0.05, 3: 0.02, 4: 0.01, 5: 0.005 };
 const STORAGE_KEY = 'writeonstl.settings.v1';
@@ -207,6 +214,14 @@ function showVersion(v) {
 function updateModelInfo() {
   const v = current();
   if (!v) return;
+  if (batch) {
+    const c = batch.case;
+    $('#modelInfo').classList.remove('muted');
+    $('#modelInfo').innerHTML =
+      `<b>${escapeHtml(c.name)}</b> · aligner case<br>${c.models.length} models · subsetups ${c.stages[0]}–${c.stages[c.stages.length - 1]}` +
+      `<br>Showing: ${escapeHtml(modelName)}`;
+    return;
+  }
   const s = modelBox.getSize(new THREE.Vector3());
   const tris = v.soup.length / 9;
   const status = v.manifold
@@ -224,6 +239,7 @@ function escapeHtml(s) {
 }
 
 function loadModel(name, soup, manifold) {
+  closeAlignerCase(false);
   for (const v of versions) v.manifold?.delete();
   if (manifold === undefined) {
     try {
@@ -297,17 +313,6 @@ function reset() {
 
 // ---------------------------------------------------------------- loading --
 
-async function loadSTLFile(file) {
-  await busy(`Loading ${file.name}…`, async () => {
-    const buf = await file.arrayBuffer();
-    const geom = new STLLoader().parse(buf);
-    const g = geom.index ? geom.toNonIndexed() : geom;
-    const soup = new Float32Array(g.attributes.position.array);
-    if (!soup.length) throw new Error('That STL file has no triangles.');
-    if (loadModel(file.name, soup)) toast(`Loaded ${file.name}`);
-  });
-}
-
 function loadSample(kind) {
   const { Manifold, CrossSection } = M();
   let m;
@@ -371,6 +376,7 @@ let textSolid = null; // manifold of the current text, in world space
 let textSolidFull = false; // false while dragging (surface following skipped)
 let textSize = null;
 let textOffSurface = false;
+let textCrossesEdge = false;
 
 const raycaster = new THREE.Raycaster();
 raycaster.firstHitOnly = true;
@@ -419,11 +425,19 @@ function placeAt(hit, keepUp) {
     const u = keepUp.clone().addScaledVector(hit.normal, -keepUp.dot(hit.normal));
     if (u.lengthSq() > 1e-4) up = u.normalize();
   }
-  placement = { point: hit.point, normal: hit.normal, up };
+  placement = { point: hit.point, normal: hit.normal, up, rotation: params.rotation };
+  if (batch) {
+    batch.slots[batch.jaw][batch.kind] = placement;
+    updateBatchUI();
+  }
 }
 
 function clearPlacement() {
   placement = null;
+  if (batch) {
+    batch.slots[batch.jaw][batch.kind] = null;
+    updateBatchUI();
+  }
   textSolid?.delete();
   textSolid = null;
   textSize = null;
@@ -432,18 +446,17 @@ function clearPlacement() {
   updateHint();
 }
 
-function placementMatrix() {
-  const { point, normal } = placement;
-  const up = placement.up.clone().applyAxisAngle(normal, THREE.MathUtils.degToRad(params.rotation));
+function placementMatrix(pl = placement, rot = params.rotation) {
+  const { point, normal } = pl;
+  const up = pl.up.clone().applyAxisAngle(normal, THREE.MathUtils.degToRad(rot));
   const right = new THREE.Vector3().crossVectors(up, normal).normalize();
   up.crossVectors(normal, right).normalize();
   return new THREE.Matrix4().makeBasis(right, up, normal).setPosition(point);
 }
 
 // Surface height (along the placement normal) under local text coords (x, y).
-function makeHeightAt(matrix, normal) {
-  const bvh = modelMesh.geometry.boundsTree;
-  const R = modelDiag * 1.5 + 10;
+function makeHeightAt(matrix, normal, bvh = modelMesh.geometry.boundsTree, diag = modelDiag) {
+  const R = diag * 1.5 + 10;
   const ray = new THREE.Ray();
   const dir = normal.clone().negate();
   const origin = new THREE.Vector3();
@@ -463,23 +476,55 @@ function makeHeightAt(matrix, normal) {
   };
 }
 
-let contourCache = { key: '', value: null };
-function getContours() {
-  const key = JSON.stringify([params.fontName, params.text, params.height, params.letterSpacing, params.lineSpacing, params.align, params.quality]);
-  if (contourCache.key !== key) {
-    contourCache = {
-      key,
-      value: textToContours(font, {
-        text: params.text,
-        height: params.height,
-        letterSpacing: params.letterSpacing,
-        lineSpacing: params.lineSpacing,
-        align: params.align,
-        tolerance: QUALITY_TOLERANCE[params.quality] ?? 0.02,
-      }),
-    };
+const contourCache = new Map(); // text -> outlines, for the current style
+let contourStyle = '';
+function contoursFor(text) {
+  const style = JSON.stringify([params.fontName, params.height, params.letterSpacing, params.lineSpacing, params.align, params.quality]);
+  if (style !== contourStyle) {
+    contourCache.clear();
+    contourStyle = style;
   }
-  return contourCache.value;
+  let v = contourCache.get(text);
+  if (!v) {
+    v = textToContours(font, {
+      text,
+      height: params.height,
+      letterSpacing: params.letterSpacing,
+      lineSpacing: params.lineSpacing,
+      align: params.align,
+      tolerance: QUALITY_TOLERANCE[params.quality] ?? 0.02,
+    });
+    if (contourCache.size > 64) contourCache.delete(contourCache.keys().next().value);
+    contourCache.set(text, v);
+  }
+  return v;
+}
+
+/** The text being edited: the plain text, or in an aligner case the number / T label. */
+function currentText() {
+  if (!batch) return params.text;
+  return batch.kind === 't' ? params.batchT : labelText(params.batchTemplate, batch.stage);
+}
+
+/**
+ * The text solid for outlines placed at `pl` (rotated by `rot` degrees) on the
+ * model whose BVH is `bvh`, using the current style settings.
+ */
+function solidFor(contours, pl, rot, conform, bvh = modelMesh.geometry.boundsTree, diag = modelDiag) {
+  if (!contours.length) return null;
+  const matrix = placementMatrix(pl, rot);
+  return buildTextSolid({
+    contours,
+    mirror: params.mirror,
+    weight: params.weight,
+    mode: params.mode,
+    depth: params.depth,
+    embed: params.embed,
+    conform,
+    heightAt: makeHeightAt(matrix, pl.normal, bvh, diag),
+    refine: clamp(params.height / 12, 0.2, 2),
+    matrix: matrix.elements,
+  });
 }
 
 function rebuildText(full = true) {
@@ -490,29 +535,17 @@ function rebuildText(full = true) {
     previewMesh.visible = ghostMesh.visible = false;
     updateButtons();
     updateHint();
+    if (batch) rebuildOtherLabel();
     return;
   }
-  const { contours, width, height } = getContours();
-  const matrix = placementMatrix();
-  const res = contours.length
-    ? buildTextSolid({
-        contours,
-        mirror: params.mirror,
-        weight: params.weight,
-        mode: params.mode,
-        depth: params.depth,
-        embed: params.embed,
-        conform: params.conform && full,
-        heightAt: makeHeightAt(matrix, placement.normal),
-        refine: clamp(params.height / 12, 0.2, 2),
-        matrix: matrix.elements,
-      })
-    : null;
+  const { contours, width, height } = contoursFor(currentText());
+  const res = solidFor(contours, placement, params.rotation, params.conform && full);
 
   if (res) {
     textSolid = res.solid;
     textSolidFull = full;
     textOffSurface = res.offSurface;
+    textCrossesEdge = res.crossesEdge;
     textSize = { width: width + 2 * params.weight, height: height + 2 * params.weight };
     const old = previewMesh.geometry;
     const g = geometryFromSoup(manifoldToSoup(textSolid), true);
@@ -526,6 +559,7 @@ function rebuildText(full = true) {
   }
   updateButtons();
   updateHint();
+  if (batch) rebuildOtherLabel();
 }
 
 let rebuildTimer = 0;
@@ -559,7 +593,7 @@ async function selectFont(name) {
     toast(e.message, true);
     return;
   }
-  contourCache.key = '';
+  contourStyle = '';
   scheduleRebuild(0);
 }
 
@@ -629,14 +663,391 @@ function exportSTL() {
   const v = current();
   if (!v) return;
   const data = soupToSTL(v.soup, `WriteOnSTL ${modelName}`);
-  const blob = new Blob([data], { type: 'model/stl' });
+  download(new Blob([data], { type: 'model/stl' }), downloadName(v));
+}
+
+// ------------------------------------------------------------ aligner case --
+//
+// An aligner export holds one model per jaw and stage (plus an attachment model for stage 1).
+// The user places the number on stage 1 of each jaw (and the T on its attachment model); the
+// same spot, orientation and style are then used for every stage, each with its own number.
+
+/**
+ * @type {null | {
+ *   case: import('./aligner.js').AlignerCase,
+ *   jaw: 'upper'|'lower', kind: 'number'|'t', stage: number,
+ *   slots: Record<'upper'|'lower', { number: object|null, t: object|null }>,
+ *   soups: Map<string, {soup: Float32Array, header: string}>, shown: boolean, seq: number,
+ * }}
+ */
+let batch = null;
+
+const otherMaterial = new THREE.MeshStandardMaterial({ color: 0x8b5cf6, roughness: 0.6, transparent: true, opacity: 0.55 });
+const otherMesh = new THREE.Mesh(new THREE.BufferGeometry(), otherMaterial);
+otherMesh.visible = false;
+scene.add(otherMesh);
+
+function parseSTL(buf) {
+  const geom = new STLLoader().parse(buf);
+  const g = geom.index ? geom.toNonIndexed() : geom;
+  const soup = new Float32Array(g.attributes.position.array);
+  // keep the original header (e.g. "3Shape") in what we write back
+  const head = new Uint8Array(buf, 0, Math.min(80, buf.byteLength));
+  let header = '';
+  for (const c of head) {
+    if (c === 0) break;
+    header += String.fromCharCode(c);
+  }
+  if (/^\s*solid\b/i.test(header)) header = ''; // ASCII STL: no binary header to keep
+  return { soup, header: header.trim() };
+}
+
+const hasAttachments = (jaw) => !!batch && !!findModel(batch.case, jaw, firstStage(batch.case, jaw), true);
+
+/** The model on screen for the current jaw / label / stage. */
+function batchModel() {
+  const c = batch.case;
+  if (batch.kind === 't') return findModel(c, batch.jaw, firstStage(c, batch.jaw), true);
+  return findModel(c, batch.jaw, batch.stage, false);
+}
+
+async function batchSoup(m) {
+  let v = batch.soups.get(m.path);
+  if (!v) {
+    v = parseSTL(await m.entry.read());
+    if (!v.soup.length) throw new Error(`${m.path} has no triangles.`);
+    batch.soups.set(m.path, v);
+    // keep a few models in memory for quick switching
+    if (batch.soups.size > 6) batch.soups.delete(batch.soups.keys().next().value);
+  }
+  return v;
+}
+
+function openAlignerCase(c) {
+  closeAlignerCase(false);
+  const jaw = c.jaws[0];
+  batch = {
+    case: c,
+    jaw,
+    kind: 'number',
+    stage: firstStage(c, jaw) ?? c.stages[0],
+    slots: { upper: { number: null, t: null }, lower: { number: null, t: null } },
+    soups: new Map(),
+    shown: false,
+    seq: 0,
+  };
+  if (!params.batchSized) {
+    // aligner models are small: start with a small, shallow label (remembered afterwards)
+    params.height = 4;
+    params.depth = 0.6;
+    params.batchSized = true;
+    save();
+  }
+  syncControls();
+  updateBatchUI();
+  const jaws = c.jaws.map((j) => JAW_LABEL[j].toLowerCase()).join(' and ');
+  toast(`Aligner case “${c.name}”: ${c.models.length} models (${jaws}), stages ${c.stages[0]}–${c.stages[c.stages.length - 1]}.` +
+    (c.skipped.length ? ` Skipped ${c.skipped.length} file(s) that are not maxillary/mandibular.` : ''), false, 6000);
+  return showBatchModel();
+}
+
+function closeAlignerCase(clearView = true) {
+  if (!batch) return;
+  batch = null;
+  otherMesh.visible = false;
+  if (clearView) {
+    versions = [];
+    modelMesh.visible = false;
+    $('#empty').classList.remove('hidden');
+    $('#modelInfo').classList.add('muted');
+    $('#modelInfo').textContent = 'Drop an .stl file, an aligner export folder or its ZIPs anywhere on the page.';
+    clearPlacement();
+  }
+  syncControls();
+  updateBatchUI();
+  updateButtons();
+  updateHint();
+}
+
+/** Show the model for the current jaw / label / stage, with that slot's label. */
+async function showBatchModel() {
+  const m = batchModel();
+  if (!m) return;
+  const seq = ++batch.seq;
+  // reading a model takes a moment: say so unless it is already in memory
+  const cached = batch.soups.has(m.path);
+  if (!cached) {
+    $('#busyText').textContent = `Loading ${JAW_LABEL[m.jaw].toLowerCase()} subsetup ${m.stage}…`;
+    $('#busy').classList.add('on');
+  }
+  let soup;
+  try {
+    ({ soup } = await batchSoup(m));
+  } finally {
+    if (!cached) $('#busy').classList.remove('on');
+  }
+  if (!batch || seq !== batch.seq) return; // a newer choice won
+  for (const v of versions) v.manifold?.delete();
+  versions = [{ soup, manifold: null }];
+  modelName = `${JAW_LABEL[m.jaw]} · Subsetup ${m.stage}${m.attachments ? ' · with attachments' : ''}`;
+  showVersion(current());
+  updateGrid();
+  if (!batch.shown) {
+    batch.shown = true;
+    controls.bounds.copy(modelBox);
+    controls.reset();
+  }
+  placement = batch.slots[batch.jaw][batch.kind];
+  setParam('rotation', placement?.rotation ?? 0);
+  syncControls();
+  updateBatchUI();
+  scheduleRebuild(0);
+}
+
+function setBatch(changes) {
+  if (!batch) return;
+  if (placement) placement.rotation = params.rotation;
+  Object.assign(batch, changes);
+  const c = batch.case;
+  if (!c.jaws.includes(batch.jaw)) batch.jaw = c.jaws[0];
+  if (batch.kind === 't' && !hasAttachments(batch.jaw)) batch.kind = 'number';
+  // stay on a stage this jaw has
+  const stages = c.models.filter((m) => m.jaw === batch.jaw && !m.attachments).map((m) => m.stage);
+  if (!stages.includes(batch.stage)) batch.stage = stages[0];
+  showBatchModel().catch((e) => toast(e.message || String(e), true));
+}
+
+/** The other label of this model, shown in purple so the two don't overlap. */
+function rebuildOtherLabel() {
+  otherMesh.visible = false;
+  if (!batch || !font) return;
+  const m = batchModel();
+  if (!m) return;
+  const slots = batch.slots[batch.jaw];
+  let slot = null, text = '';
+  if (batch.kind === 't' && params.batchNumberAttach) {
+    slot = slots.number;
+    text = labelText(params.batchTemplate, m.stage);
+  } else if (batch.kind === 'number' && m.stage === firstStage(batch.case, batch.jaw) && hasAttachments(batch.jaw)) {
+    slot = slots.t;
+    text = params.batchT;
+  }
+  if (!slot) return;
+  const res = solidFor(contoursFor(text).contours, slot, slot.rotation ?? 0, false);
+  if (!res) return;
+  const g = geometryFromSoup(manifoldToSoup(res.solid), true);
+  res.solid.delete();
+  otherMesh.geometry.dispose();
+  otherMesh.geometry = g;
+  otherMesh.visible = true;
+}
+
+/** What still has to be placed before the case can be processed. */
+function batchMissing() {
+  const missing = [];
+  for (const jaw of batch.case.jaws) {
+    if (!batch.slots[jaw].number) missing.push(`the number on ${JAW_LABEL[jaw].toLowerCase()} stage ${firstStage(batch.case, jaw)}`);
+    if (hasAttachments(jaw) && !batch.slots[jaw].t) missing.push(`the T on the ${JAW_LABEL[jaw].toLowerCase()} attachment model`);
+  }
+  return missing;
+}
+
+function updateBatchUI() {
+  const on = !!batch;
+  $('#batchSection').classList.toggle('hidden', !on);
+  $('#textHint').classList.toggle('hidden', !on);
+  for (const id of ['apply', 'undo', 'reset', 'export']) $(`#${id}`).classList.toggle('hidden', on);
+  $('.actions .row').classList.toggle('hidden', on);
+  $('#batchProcess').classList.toggle('hidden', !on);
+  if (!on) return;
+  const c = batch.case;
+  setSeg('batchJaw', batch.jaw);
+  setSeg('batchKind', batch.kind);
+  for (const b of document.querySelectorAll('#batchJaw button')) b.disabled = !c.jaws.includes(b.dataset.v);
+  $('#batchKind button[data-v="t"]').disabled = !hasAttachments(batch.jaw);
+  // stage picker: only for the number (the T lives on stage 1's attachment model)
+  $('#stageRow').classList.toggle('hidden', batch.kind === 't');
+  const stages = c.models.filter((m) => m.jaw === batch.jaw && !m.attachments).map((m) => m.stage);
+  const sel = $('#stageSelect');
+  const opts = stages.map((st) => `<option value="${st}">Subsetup ${st} of ${stages.length}</option>`).join('');
+  if (sel.dataset.opts !== opts) {
+    sel.innerHTML = opts;
+    sel.dataset.opts = opts;
+  }
+  sel.value = String(batch.stage);
+  $('#stagePrev').disabled = stages.indexOf(batch.stage) <= 0;
+  $('#stageNext').disabled = stages.indexOf(batch.stage) >= stages.length - 1;
+  // status per jaw
+  const tick = (ok, what) => `<span class="${ok ? 'ok' : 'todo'}">${ok ? '✓' : '○'} ${what}</span>`;
+  $('#batchStatus').innerHTML = c.jaws
+    .map((jaw) => {
+      const n = c.models.filter((m) => m.jaw === jaw).length;
+      const parts = [tick(!!batch.slots[jaw].number, 'number')];
+      if (hasAttachments(jaw)) parts.push(tick(!!batch.slots[jaw].t, 'T'));
+      return `<li><b>${JAW_LABEL[jaw]}</b> · ${n} model${n > 1 ? 's' : ''} · ${parts.join(' · ')}</li>`;
+    })
+    .join('');
+  const anyAttach = c.jaws.some(hasAttachments);
+  $('#batchNumberAttach').closest('label').classList.toggle('hidden', !anyAttach);
+  $('#batchNumberAttach').checked = params.batchNumberAttach;
+  $('#textHint').textContent =
+    batch.kind === 't'
+      ? `Goes on the subsetup ${firstStage(c, batch.jaw)} model with attachments only.`
+      : `“{n}” is replaced by the subsetup number, e.g. “${labelText(params.batchTemplate, batch.stage)}” here. The same spot is used on every stage.`;
+  const missing = batchMissing();
+  $('#batchProcess').disabled = missing.length > 0;
+  $('#batchProcess').textContent = `Label all ${c.models.length} models & download ZIP`;
+  $('#batchProcess').title = missing.length ? `Still to place: ${missing.join(', ')}` : '';
+  updateModelInfo();
+}
+
+/** Label every model of the case and download them as a ZIP with the export's folder layout. */
+async function processBatch() {
+  if (!batch) return;
+  const missing = batchMissing();
+  if (missing.length) {
+    toast(`Still to place: ${missing.join(', ')}.`, true, 6000);
+    return;
+  }
+  if (placement) placement.rotation = params.rotation;
+  const c = batch.case;
+  const t0 = performance.now();
+  const files = {};
+  let fallback = 0;
+  const uneven = new Set();
+  const ok = await busy('Labelling models…', async () => {
+    for (let i = 0; i < c.models.length; i++) {
+      const m = c.models[i];
+      $('#busyText').textContent = `Labelling ${i + 1} of ${c.models.length}: ${JAW_LABEL[m.jaw]} subsetup ${m.stage}${m.attachments ? ' (attachments)' : ''}…`;
+      await new Promise((r) => setTimeout(r, 0)); // let the progress paint
+      const slots = batch.slots[m.jaw];
+      const labels = [];
+      if (!m.attachments || params.batchNumberAttach) labels.push({ text: labelText(params.batchTemplate, m.stage), slot: slots.number });
+      if (m.attachments) labels.push({ text: params.batchT, slot: slots.t });
+      for (let k = labels.length - 1; k >= 0; k--) if (!labels[k].slot) labels.splice(k, 1);
+
+      const src = batch.soups.get(m.path) || parseSTL(await m.entry.read());
+      const g = new THREE.BufferGeometry();
+      g.setAttribute('position', new THREE.BufferAttribute(src.soup, 3));
+      const bvh = new MeshBVH(g);
+      g.computeBoundingBox();
+      const diag = g.boundingBox.getSize(new THREE.Vector3()).length() || 100;
+
+      let man = null;
+      try {
+        man = soupToManifold(src.soup);
+      } catch {
+        man = null;
+      }
+      let soup = src.soup;
+      for (const { text, slot } of labels) {
+        const res = solidFor(contoursFor(text).contours, slot, slot.rotation ?? 0, params.conform, bvh, diag);
+        if (!res) continue;
+        if (res.offSurface || res.crossesEdge) uneven.add(`${JAW_LABEL[m.jaw].toLowerCase()} ${m.stage}${m.attachments ? ' (attachments)' : ''}`);
+        if (man) {
+          const next = booleanOp(man, res.solid, params.mode);
+          man.delete();
+          man = next;
+        } else {
+          soup = fallbackBoolean(soup, manifoldToSoup(res.solid), params.mode);
+          fallback++;
+        }
+        res.solid.delete();
+      }
+      if (man) {
+        soup = manifoldToSoup(man);
+        man.delete();
+      }
+      files[m.path] = new Uint8Array(soupToSTL(soup, src.header || 'WriteOnSTL'));
+    }
+    if (c.xml) files[c.xml.path.replace(/\\/g, '/').split('/').pop()] = new Uint8Array(await c.xml.read());
+    $('#busyText').textContent = 'Compressing ZIP…';
+    const data = await new Promise((resolve, reject) => zip(files, { level: 6 }, (err, out) => (err ? reject(err) : resolve(out))));
+    download(new Blob([data], { type: 'application/zip' }), `${fileSafe(c.name) || 'aligner'}_labelled.zip`);
+    return true;
+  });
+  if (!ok) return;
+  const secs = ((performance.now() - t0) / 1000).toFixed(0);
+  const warn = [];
+  if (fallback) warn.push('some models were not watertight; check them');
+  if (uneven.size) warn.push(`a label crosses an edge or hangs off on ${[...uneven].slice(0, 4).join(', ')}${uneven.size > 4 ? ' …' : ''}; check those models`);
+  toast(`Labelled ${c.models.length} models in ${secs} s — ZIP downloaded.` + (warn.length ? ` Note: ${warn.join('; ')}.` : ''), warn.length > 0, warn.length ? 10000 : 6000);
+}
+
+function download(blob, name) {
   const a = document.createElement('a');
   a.href = URL.createObjectURL(blob);
-  a.download = downloadName(v);
+  a.download = name;
   document.body.appendChild(a);
   a.click();
   a.remove();
-  setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+  setTimeout(() => URL.revokeObjectURL(a.href), 10000);
+}
+
+// ---------------------------------------------------------- opening files --
+
+/** Files (from a picker or a drop, ZIPs unpacked) as path + reader entries. */
+async function filesToEntries(files) {
+  const entries = [];
+  for (const f of files) {
+    if (/\.zip$/i.test(f.name)) {
+      const data = new Uint8Array(await f.arrayBuffer());
+      const out = await new Promise((resolve, reject) =>
+        unzip(data, { filter: (z) => /\.(stl|xml)$/i.test(z.name) }, (err, r) => (err ? reject(err) : resolve(r))),
+      );
+      for (const [path, u8] of Object.entries(out)) {
+        entries.push({ path, read: async () => u8.buffer.slice(u8.byteOffset, u8.byteOffset + u8.byteLength) });
+      }
+    } else {
+      entries.push({ path: f.relPath || f.webkitRelativePath || f.name, read: () => f.arrayBuffer() });
+    }
+  }
+  return entries;
+}
+
+/** Open whatever was picked or dropped: fonts, a single STL, or an aligner export (folder or ZIPs). */
+async function openFiles(files) {
+  const fonts = files.filter((f) => /\.(ttf|otf|woff)$/i.test(f.name));
+  const models = files.filter((f) => /\.(stl|zip)$/i.test(f.name));
+  const xmls = files.filter((f) => /\.xml$/i.test(f.name));
+  for (const f of files) {
+    if (!fonts.includes(f) && !models.includes(f) && !xmls.includes(f) && !f.relPath && !f.webkitRelativePath) toast(`Unsupported file: ${f.name}`, true);
+  }
+  for (const f of fonts) await loadFontFile(f);
+  if (!models.length) return;
+  await busy(models.length > 1 || models[0].relPath || models[0].webkitRelativePath || /\.zip$/i.test(models[0].name) ? 'Reading files…' : `Loading ${models[0].name}…`, async () => {
+    const entries = await filesToEntries([...models, ...xmls]);
+    const c = parseAlignerFiles(entries);
+    if (c) return openAlignerCase(c);
+    const stls = entries.filter((e) => /\.stl$/i.test(e.path));
+    if (!stls.length) throw new Error('No STL files found.');
+    const first = stls[0];
+    const name = first.path.split('/').pop();
+    const { soup } = parseSTL(await first.read());
+    if (!soup.length) throw new Error('That STL file has no triangles.');
+    if (loadModel(name, soup)) toast(stls.length > 1 ? `Loaded ${name} (the first of ${stls.length} STL files)` : `Loaded ${name}`);
+  });
+}
+
+/** Everything inside dropped folders (DataTransfer entries), with paths relative to the drop. */
+async function walkEntries(entries) {
+  const out = [];
+  const walk = async (entry) => {
+    if (entry.isFile) {
+      const file = await new Promise((res, rej) => entry.file(res, rej));
+      file.relPath = entry.fullPath.replace(/^\//, '');
+      out.push(file);
+    } else if (entry.isDirectory) {
+      const reader = entry.createReader();
+      for (;;) {
+        const batchOf = await new Promise((res, rej) => reader.readEntries(res, rej));
+        if (!batchOf.length) break;
+        for (const e of batchOf) await walk(e);
+      }
+    }
+  };
+  for (const e of entries) await walk(e);
+  return out;
 }
 
 // -------------------------------------------------------------------- views --
@@ -661,14 +1072,32 @@ function updateHint() {
   const el = $('#hint');
   let msg;
   let ready = false;
+  if (batch) {
+    const what = batch.kind === 't' ? 'the T' : 'the number';
+    const missing = batchMissing();
+    if (!placement) msg = `Click on the model where ${what} should go.`;
+    else if (!currentText().trim()) msg = 'Type the label above.';
+    else if (!textSolid) msg = 'Building label…';
+    else {
+      ready = !missing.length;
+      msg = `Drag ${what} to move it, Ctrl+drag to rotate, scroll over it to resize.`;
+      if (textOffSurface) msg = `⚠ Part of the label hangs off the surface. ${msg}`;
+      else if (textCrossesEdge) msg = `⚠ The label crosses an edge or step — move it onto an even area. ${msg}`;
+    }
+    msg += missing.length ? ` Still to place: ${missing.join('; ')}.` : ' Everything is placed — label all models when ready.';
+    el.textContent = msg;
+    el.classList.toggle('ready', ready);
+    return;
+  }
   if (!versions.length) msg = 'Load a model, then click on it to place the text.';
   else if (!placement) msg = 'Click on the model where the text should go.';
-  else if (!params.text.trim()) msg = 'Type some text above.';
+  else if (!currentText().trim()) msg = 'Type some text above.';
   else if (!textSolid) msg = 'Building text…';
   else {
     ready = true;
     msg = `Text is ${fmt(textSize.width)} × ${fmt(textSize.height)} mm. Drag it to move, Ctrl+drag to rotate, scroll over it to resize; click elsewhere to re-place.`;
     if (textOffSurface) msg = `⚠ Part of the text hangs off the surface — make it smaller or move it. ${msg}`;
+    else if (textCrossesEdge) msg = `⚠ The text crosses an edge or step of the surface — move it onto an even area. ${msg}`;
   }
   el.textContent = msg;
   el.classList.toggle('ready', ready);
@@ -704,6 +1133,7 @@ function buildControls() {
     const commit = (v, from) => {
       if (!Number.isFinite(v)) return;
       params[key] = v;
+      if (key === 'rotation' && placement) placement.rotation = v;
       if (from !== range) range.value = v;
       if (from !== num) num.value = v;
       save();
@@ -720,7 +1150,7 @@ function syncControls() {
     range.value = params[key];
     num.value = params[key];
   }
-  $('#text').value = params.text;
+  $('#text').value = !batch ? params.text : batch.kind === 't' ? params.batchT : params.batchTemplate;
   $('#conform').checked = params.conform;
   $('#mirror').checked = params.mirror;
   setSeg('align', params.align);
@@ -756,10 +1186,32 @@ function wireUI() {
   syncControls();
 
   $('#stlInput').addEventListener('change', (e) => {
-    const f = e.target.files[0];
-    if (f) loadSTLFile(f);
+    const files = [...e.target.files];
     e.target.value = '';
+    if (files.length) openFiles(files);
   });
+  $('#folderInput').addEventListener('change', (e) => {
+    const files = [...e.target.files];
+    e.target.value = '';
+    if (files.length) openFiles(files);
+  });
+  for (const b of document.querySelectorAll('#batchJaw button')) b.addEventListener('click', () => setBatch({ jaw: b.dataset.v }));
+  for (const b of document.querySelectorAll('#batchKind button')) b.addEventListener('click', () => setBatch({ kind: b.dataset.v }));
+  const stepStage = (d) => {
+    const stages = batch.case.models.filter((m) => m.jaw === batch.jaw && !m.attachments).map((m) => m.stage);
+    const i = stages.indexOf(batch.stage) + d;
+    if (i >= 0 && i < stages.length) setBatch({ stage: stages[i] });
+  };
+  $('#stagePrev').addEventListener('click', () => stepStage(-1));
+  $('#stageNext').addEventListener('click', () => stepStage(1));
+  $('#stageSelect').addEventListener('change', (e) => setBatch({ stage: Number(e.target.value) }));
+  $('#batchNumberAttach').addEventListener('change', (e) => {
+    params.batchNumberAttach = e.target.checked;
+    save();
+    rebuildOtherLabel();
+  });
+  $('#batchClose').addEventListener('click', () => closeAlignerCase());
+  $('#batchProcess').addEventListener('click', processBatch);
   $('#fontInput').addEventListener('change', (e) => {
     const f = e.target.files[0];
     if (f) loadFontFile(f);
@@ -769,7 +1221,9 @@ function wireUI() {
     b.addEventListener('click', () => loadSample(b.dataset.sample));
   }
   $('#text').addEventListener('input', (e) => {
-    params.text = e.target.value;
+    if (!batch) params.text = e.target.value;
+    else if (batch.kind === 't') params.batchT = e.target.value;
+    else params.batchTemplate = e.target.value;
     save();
     scheduleRebuild(150);
   });
@@ -831,11 +1285,11 @@ function wireUI() {
     e.preventDefault();
     dragDepth = 0;
     document.body.classList.remove('dragging');
-    for (const f of e.dataTransfer.files) {
-      if (/\.stl$/i.test(f.name)) loadSTLFile(f);
-      else if (/\.(ttf|otf|woff)$/i.test(f.name)) loadFontFile(f);
-      else toast(`Unsupported file: ${f.name}`, true);
-    }
+    // read the entries now: the DataTransfer is emptied once this handler returns
+    const items = [...e.dataTransfer.items].map((i) => i.webkitGetAsEntry?.()).filter(Boolean);
+    const files = [...e.dataTransfer.files];
+    if (items.some((it) => it.isDirectory)) walkEntries(items).then(openFiles, (err) => toast(err.message, true));
+    else openFiles(files);
   });
 
   wireViewport();
@@ -873,6 +1327,7 @@ function textAngleAt(e) {
 
 function setParam(key, value) {
   params[key] = value;
+  if (key === 'rotation' && placement) placement.rotation = value;
   const c = ctlInputs[key];
   if (c) c.range.value = c.num.value = value;
   save();
