@@ -83,3 +83,17 @@ export function firstStage(c, jaw) {
 export function findModel(c, jaw, stage, attachments = false) {
   return c.models.find((m) => m.jaw === jaw && m.stage === stage && m.attachments === attachments) || null;
 }
+
+/**
+ * File name of a labelled model in the flat export: the model's name, then the
+ * subsetup number, e.g. "Mandibular 3.stl" or "Maxillary 1 with attachments.stl".
+ */
+export function outputName(m) {
+  const file = m.path.replace(/\\/g, '/').split('/').pop().replace(/\.stl$/i, '');
+  const base =
+    file
+      .replace(/[\s_-]*(with[\s_-]*)?attach(ment)?s?/i, '')
+      .replace(/[\s_]+/g, ' ')
+      .trim() || JAW_LABEL[m.jaw];
+  return `${base} ${m.stage}${m.attachments ? ' with attachments' : ''}.stl`;
+}
