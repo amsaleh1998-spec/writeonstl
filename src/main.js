@@ -592,10 +592,37 @@ async function applyText() {
     } else {
       next = { soup: fallbackBoolean(cur.soup, manifoldToSoup(textSolid), params.mode), manifold: null };
     }
+    // remember every text applied so far (used for the download's file name)
+    next.texts = [...(cur.texts || []), params.text];
     pushVersion(next);
     clearPlacement();
     toast(params.mode === 'emboss' ? 'Text embossed ✓ — click to add more, or download.' : 'Text engraved ✓ — click to add more, or download.');
   });
+}
+
+/** Make a string safe as part of a file name on Windows, macOS and Linux. */
+function fileSafe(s) {
+  return s
+    .normalize('NFC')
+    .replace(/[\u0000-\u001f\u007f<>:"/\\|?*]+/g, ' ') // characters file systems reject
+    .trim()
+    .replace(/\s+/g, '_')
+    .replace(/^[.]+|[.]+$/g, ''); // no leading/trailing dots
+}
+
+/** e.g. "plate-Hello.stl", or "plate-Hello-Batch_42.stl" after two texts. */
+function downloadName(v) {
+  const MAX = 100; // keep the text part of the name reasonably short
+  const parts = [];
+  for (const t of v.texts || []) {
+    const part = fileSafe(t);
+    if (part && !parts.includes(part)) parts.push(part);
+  }
+  let suffix = parts.join('-');
+  if (suffix.length > MAX) suffix = suffix.slice(0, MAX).replace(/[-_.]+$/, '');
+  if (!suffix && versions.length > 1) suffix = 'text';
+  const base = modelName.replace(/[\u0000-\u001f\u007f<>:"/\\|?*]+/g, '_').trim() || 'model';
+  return `${base}${suffix ? '-' + suffix : ''}.stl`;
 }
 
 function exportSTL() {
@@ -605,7 +632,7 @@ function exportSTL() {
   const blob = new Blob([data], { type: 'model/stl' });
   const a = document.createElement('a');
   a.href = URL.createObjectURL(blob);
-  a.download = `${modelName}${versions.length > 1 ? '-text' : ''}.stl`;
+  a.download = downloadName(v);
   document.body.appendChild(a);
   a.click();
   a.remove();

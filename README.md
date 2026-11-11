@@ -29,6 +29,7 @@ Everything runs locally in the browser, so your files are never uploaded anywher
 - **12 bundled fonts**, and you can upload your own `.ttf`, `.otf` or `.woff` font.
 - **Exact, watertight booleans** using [Manifold](https://github.com/elalish/manifold). If an STL isn't watertight, the app falls back to approximate CSG ([three-bvh-csg](https://github.com/gkjohnson/three-bvh-csg)) and warns you.
 - Apply several texts one after another, with **Undo** (Ctrl/⌘+Z) and **Reset**, then **Download STL**.
+  The downloaded file is named after the model and the texts you added, e.g. `plate-Hello-Lot_7.stl`. Spaces and line breaks become `_`, and characters that file names can't contain are removed.
 
 Units are assumed to be millimetres, which is the convention for 3D-printing STLs.
 
