@@ -1,5 +1,4 @@
 import * as THREE from 'three';
-import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import { STLLoader } from 'three/examples/jsm/loaders/STLLoader.js';
 import { toCreasedNormals } from 'three/examples/jsm/utils/BufferGeometryUtils.js';
 import { MeshBVH, acceleratedRaycast } from 'three-mesh-bvh';
@@ -9,6 +8,8 @@ import {
   initManifold, M, soupToManifold, manifoldToSoup, buildTextSolid, booleanOp, soupToSTL,
 } from './geom.js';
 import { parseFont, fontDisplayName, textToContours } from './text.js';
+import { ViewControls } from './viewControls.js';
+import { SpaceMouse } from './spacemouse.js';
 
 THREE.Mesh.prototype.raycast = acceleratedRaycast;
 
@@ -107,14 +108,13 @@ const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
 renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
 
 const scene = new THREE.Scene();
-const camera = new THREE.PerspectiveCamera(35, 1, 0.1, 10000);
-camera.up.set(0, 0, 1);
-camera.position.set(120, -160, 110);
+const camera = new THREE.PerspectiveCamera(30, 1, 0.1, 10000);
 scene.add(camera);
 
-const controls = new OrbitControls(camera, canvas);
-controls.enableDamping = true;
-controls.dampingFactor = 0.12;
+// Same camera behaviour as the Quick DICOM Planning 3D view (free rotation, flick,
+// zoom at the cursor, middle-click rotation centre, SpaceMouse).
+const controls = new ViewControls(camera, viewport);
+controls.fit();
 
 // Lights ride along with the camera so the model is always well lit, with
 // the key light coming from the upper left so raised/cut letters cast shading.
@@ -172,8 +172,12 @@ function resize() {
 new ResizeObserver(resize).observe(viewport);
 resize();
 
+const pivotEl = $('#pivot');
 renderer.setAnimationLoop(() => {
   controls.update();
+  const pv = controls.pivotMarker();
+  pivotEl.classList.toggle('on', !!pv);
+  if (pv) pivotEl.style.transform = `translate(${pv[0]}px, ${pv[1]}px)`;
   renderer.render(scene, camera);
 });
 
@@ -243,7 +247,8 @@ function loadModel(name, soup, manifold) {
   save();
 
   updateGrid();
-  setView('iso');
+  controls.bounds.copy(modelBox);
+  controls.reset();
   updateHint();
   return !!manifold;
 }
@@ -407,8 +412,14 @@ function upFromCamera(normal) {
   return new THREE.Vector3(1, 0, 0);
 }
 
-function placeAt(hit) {
-  placement = { point: hit.point, normal: hit.normal, up: upFromCamera(hit.normal) };
+/** keepUp: while dragging, carry the text's orientation over instead of re-deriving it from the view */
+function placeAt(hit, keepUp) {
+  let up = upFromCamera(hit.normal);
+  if (keepUp) {
+    const u = keepUp.clone().addScaledVector(hit.normal, -keepUp.dot(hit.normal));
+    if (u.lengthSq() > 1e-4) up = u.normalize();
+  }
+  placement = { point: hit.point, normal: hit.normal, up };
 }
 
 function clearPlacement() {
@@ -604,26 +615,8 @@ function exportSTL() {
 // -------------------------------------------------------------------- views --
 
 function setView(name) {
-  const box = versions.length ? modelBox : new THREE.Box3(new THREE.Vector3(-50, -50, 0), new THREE.Vector3(50, 50, 50));
-  const center = box.getCenter(new THREE.Vector3());
-  const radius = Math.max(box.getSize(new THREE.Vector3()).length() / 2, 1);
-  const dirs = {
-    iso: [1, -1.3, 0.9],
-    top: [0, -0.001, 1],
-    bottom: [0, 0.001, -1],
-    front: [0, -1, 0],
-    right: [1, 0, 0],
-  };
-  let dir;
-  if (name === 'fit') dir = camera.position.clone().sub(controls.target).normalize();
-  else dir = new THREE.Vector3(...dirs[name]).normalize();
-  const dist = radius / Math.sin(THREE.MathUtils.degToRad(camera.fov / 2)) * 1.1;
-  controls.target.copy(center);
-  camera.position.copy(center).addScaledVector(dir, dist);
-  camera.near = Math.max(dist / 1000, 0.01);
-  camera.far = dist * 100;
-  camera.updateProjectionMatrix();
-  controls.update();
+  if (name === 'reset') controls.reset();
+  else controls.setPreset(name);
 }
 
 // --------------------------------------------------------------------- UI --
@@ -647,7 +640,7 @@ function updateHint() {
   else if (!textSolid) msg = 'Building text…';
   else {
     ready = true;
-    msg = `Text is ${fmt(textSize.width)} × ${fmt(textSize.height)} mm. Drag it to move, click elsewhere to re-place.`;
+    msg = `Text is ${fmt(textSize.width)} × ${fmt(textSize.height)} mm. Drag it to move, Ctrl+drag to rotate, scroll over it to resize; click elsewhere to re-place.`;
     if (textOffSurface) msg = `⚠ Part of the text hangs off the surface — make it smaller or move it. ${msg}`;
   }
   el.textContent = msg;
@@ -818,46 +811,287 @@ function wireUI() {
     }
   });
 
-  // Click on the model to place text, drag the text to move it.
-  let down = null;
-  let dragging = false;
+  wireViewport();
+  wireSpaceMouse();
+}
+
+// ------------------------------------------------------------ 3D view input --
+
+const IS_MAC = /Mac|iPhone|iPad/.test(navigator.platform || navigator.userAgent);
+// a curved-arrows cursor for rotating the text
+const ROTATE_CURSOR = `url("data:image/svg+xml,${encodeURIComponent(
+  '<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24"><g fill="none" stroke-linecap="round" stroke-linejoin="round"><path d="M19 12a7 7 0 1 1-2.05-4.95M19 4v4h-4" stroke="#fff" stroke-width="4"/><path d="M19 12a7 7 0 1 1-2.05-4.95M19 4v4h-4" stroke="#000" stroke-width="2"/></g></svg>',
+)}") 12 12, alias`;
+/** the 3Dconnexion driver also turns cap motion into wheel events: ignore them meanwhile */
+let wheelBlockedUntil = 0;
+
+function viewPos(e) {
+  const r = canvas.getBoundingClientRect();
+  return [e.clientX - r.left, e.clientY - r.top];
+}
+
+/** Angle (deg) of the pointer around the text centre, measured in the text's plane. */
+function textAngleAt(e) {
+  if (!placement) return null;
+  pointerRay(e);
+  const { point, normal, up } = placement;
+  const plane = new THREE.Plane().setFromNormalAndCoplanarPoint(normal, point);
+  const hit = raycaster.ray.intersectPlane(plane, new THREE.Vector3());
+  if (!hit) return null;
+  const d = hit.sub(point);
+  const right = new THREE.Vector3().crossVectors(up, normal);
+  if (d.length() < 1e-6) return null;
+  return THREE.MathUtils.radToDeg(Math.atan2(d.dot(up), d.dot(right)));
+}
+
+function setParam(key, value) {
+  params[key] = value;
+  const c = ctlInputs[key];
+  if (c) c.range.value = c.num.value = value;
+  save();
+}
+
+/** Letter height from the mouse wheel over the text (≈5 % per wheel notch). */
+function wheelResize(e) {
+  const unit = e.deltaMode === 1 ? 33 : e.deltaMode === 2 ? 400 : 1;
+  const d = Math.max(-200, Math.min(200, (e.deltaY || e.deltaX) * unit));
+  if (!d) return;
+  const h0 = params.height;
+  let h = Math.round(h0 * Math.exp(-d * 0.0005) * 10) / 10;
+  if (h === h0) h = h0 - Math.sign(d) * 0.1; // always move at least 0.1 mm
+  h = Math.min(100, Math.max(1, Math.round(h * 10) / 10));
+  if (h === h0) return;
+  setParam('height', h);
+  scheduleFastRebuild();
+  scheduleRebuild(250);
+}
+
+function wireViewport() {
+  // drag: orbit | pan | zoom | moveText | rotateText | none
+  let drag = 'none';
+  let downPos = [0, 0];
+  let last = [0, 0];
+  let middle = false;
+  let lastAngle = null;
+  const moved = (p) => Math.hypot(p[0] - downPos[0], p[1] - downPos[1]) > 3;
+
+  canvas.addEventListener('contextmenu', (e) => e.preventDefault());
+
   canvas.addEventListener('pointerdown', (e) => {
-    if (e.button !== 0) return;
-    down = { x: e.clientX, y: e.clientY };
-    if (hitsPreview(e)) {
-      dragging = true;
-      controls.enabled = false;
+    controls.stopCoast(); // any new input takes over from a flick at once
+    const p = viewPos(e);
+    downPos = last = p;
+    // macOS: Control+click arrives as a right click – treat it as a modified left click
+    const button = IS_MAC && e.button === 2 && e.ctrlKey ? 0 : e.button;
+    middle = button === 1;
+    const rotateKey = e.ctrlKey || e.metaKey;
+    if (button === 2) drag = 'zoom';
+    else if (button === 1) drag = 'pan';
+    else if (button === 0 && !e.shiftKey && !e.altKey && hitsPreview(e)) {
+      if (rotateKey) {
+        drag = 'rotateText';
+        lastAngle = textAngleAt(e);
+        canvas.style.cursor = ROTATE_CURSOR;
+      } else {
+        drag = 'moveText';
+        canvas.style.cursor = 'grabbing';
+      }
+    } else if (button === 0 && (e.shiftKey || e.altKey)) drag = 'pan';
+    else if (button === 0) {
+      drag = 'orbit';
+      controls.beginOrbit();
+    } else drag = 'none';
+    if (drag !== 'none') {
       canvas.setPointerCapture(e.pointerId);
-      canvas.style.cursor = 'grabbing';
+      e.preventDefault();
     }
   });
+
   canvas.addEventListener('pointermove', (e) => {
-    if (dragging) {
-      const hit = pickModel(e);
-      if (hit) {
-        placeAt(hit);
-        scheduleFastRebuild();
+    const p = viewPos(e);
+    const dx = p[0] - last[0], dy = p[1] - last[1];
+    last = p;
+    switch (drag) {
+      case 'orbit':
+        controls.dragOrbit(dx, dy);
+        break;
+      case 'pan':
+        controls.pan(dx, dy);
+        break;
+      case 'zoom':
+        // drag down = zoom in, up = zoom out, around the pressed point
+        controls.zoomAt(downPos, Math.exp(-dy * 0.008));
+        break;
+      case 'moveText': {
+        const hit = pickModel(e);
+        if (hit) {
+          placeAt(hit, placement?.up);
+          scheduleFastRebuild();
+        }
+        break;
       }
+      case 'rotateText': {
+        // the grabbed point follows the mouse around the text centre
+        const a = textAngleAt(e);
+        if (a !== null && lastAngle !== null) {
+          let r = params.rotation + (a - lastAngle);
+          r = ((((r + 180) % 360) + 360) % 360) - 180;
+          setParam('rotation', Math.round(r * 10) / 10);
+          scheduleFastRebuild();
+        }
+        if (a !== null) lastAngle = a;
+        break;
+      }
+      default:
+        if (e.buttons) break;
+        canvas.style.cursor = hitsPreview(e)
+          ? e.ctrlKey || e.metaKey ? ROTATE_CURSOR : 'grab'
+          : pickModel(e) ? 'crosshair' : '';
+    }
+  });
+
+  const end = (e) => {
+    const p = viewPos(e);
+    const wasMoved = moved(p);
+    if (drag === 'orbit') {
+      controls.endOrbit(wasMoved);
+      // a click (no drag) places the text
+      if (!wasMoved && e.type === 'pointerup') {
+        const hit = pickModel(e);
+        if (hit) {
+          placeAt(hit);
+          scheduleRebuild(0);
+        }
+      }
+    } else if (drag === 'moveText' || drag === 'rotateText') {
+      canvas.style.cursor = drag === 'rotateText' ? ROTATE_CURSOR : 'grab';
+      scheduleRebuild(0);
+    } else if (drag === 'pan' && middle && !wasMoved && e.type === 'pointerup') {
+      // middle-click on the surface: that point becomes the centre of rotation
+      const hit = pickModel(e);
+      if (hit && controls.setPivot(hit.point)) toast('Rotation centre set · double-click the background or ⟲ to reset the view');
+      else toast('No surface under the cursor – middle-click on the model to set the rotation centre.', true);
+    }
+    drag = 'none';
+    middle = false;
+    lastAngle = null;
+    if (canvas.hasPointerCapture(e.pointerId)) canvas.releasePointerCapture(e.pointerId);
+  };
+  canvas.addEventListener('pointerup', end);
+  canvas.addEventListener('pointercancel', end);
+
+  canvas.addEventListener(
+    'wheel',
+    (e) => {
+      e.preventDefault();
+      controls.stopCoast();
+      // synthetic scroll/zoom from the SpaceMouse driver while the cap is moved
+      if (performance.now() < wheelBlockedUntil) return;
+      const p = viewPos(e);
+      if (e.ctrlKey || e.metaKey) {
+        // pinch (trackpads report it as ctrl+wheel) or ctrl/cmd + mouse wheel
+        const unit = e.deltaMode === 1 ? 16 : e.deltaMode === 2 ? 400 : 1;
+        const d = Math.max(-100, Math.min(100, e.deltaY * unit));
+        controls.zoomAt(p, Math.exp(d * 0.0025));
+      } else if (hitsPreview(e)) {
+        wheelResize(e);
+      } else {
+        const dir = Math.sign(e.deltaY || e.deltaX);
+        if (dir) controls.zoomAt(p, Math.exp(dir * 0.12));
+      }
+    },
+    { passive: false },
+  );
+
+  // double-click on the background: reset the view (on the model a click places the text)
+  canvas.addEventListener('dblclick', (e) => {
+    if (!pickModel(e)) controls.reset();
+  });
+
+  // show the rotate cursor as soon as Ctrl / ⌘ is pressed over the text
+  const keyCursor = (e) => {
+    if (drag !== 'none' || !hoverEvent) return;
+    const over = hitsPreview(hoverEvent);
+    if (over) canvas.style.cursor = e.ctrlKey || e.metaKey ? ROTATE_CURSOR : 'grab';
+  };
+  let hoverEvent = null;
+  canvas.addEventListener('pointermove', (e) => (hoverEvent = e));
+  canvas.addEventListener('pointerleave', () => (hoverEvent = null));
+  window.addEventListener('keydown', keyCursor);
+  window.addEventListener('keyup', keyCursor);
+}
+
+// ---------------------------------------------------------- 3Dconnexion SpaceMouse --
+
+function wireSpaceMouse() {
+  const spaceMouse = new SpaceMouse({
+    spaceMotion: (t, r, dt) => controls.spaceMotion(t, r, dt),
+    spaceButton: (i) => controls.spaceButton(i),
+  });
+  // the 3Dconnexion driver also scrolls/zooms with the cap: ignore wheel events meanwhile
+  spaceMouse.onActivity = () => (wheelBlockedUntil = performance.now() + 300);
+  window.spaceMouse = spaceMouse; // debugging / tests
+
+  const btn = $('#btn-spacemouse');
+  const speed = $('#sm-speed');
+  const invRot = $('#sm-inv-rot');
+  const invTr = $('#sm-inv-tr');
+  const refresh = () => {
+    const on = !!spaceMouse.name;
+    btn.textContent = on && spaceMouse.via === 'hid' ? 'Disconnect' : 'Connect SpaceMouse';
+    btn.classList.toggle('hidden', !spaceMouse.supported);
+    $('#sm-status').textContent = on
+      ? `${spaceMouse.name}${spaceMouse.via === 'gamepad' ? ' (game controller)' : ''}`
+      : spaceMouse.supported
+        ? ''
+        : 'Use Chrome or Edge to connect one (other browsers only if they expose it as a game controller).';
+    $('#sm-settings').classList.toggle('hidden', !on);
+    speed.value = String(spaceMouse.settings.speed);
+    $('#sm-speed-val').textContent = `${spaceMouse.settings.speed.toFixed(1)}×`;
+    invRot.checked = spaceMouse.settings.invertRotation;
+    invTr.checked = spaceMouse.settings.invertTranslation;
+  };
+  spaceMouse.onChange = () => {
+    refresh();
+    if (spaceMouse.name) toast(`SpaceMouse connected: ${spaceMouse.name}`);
+  };
+  btn.onclick = async () => {
+    if (spaceMouse.via === 'hid') {
+      await spaceMouse.disconnect();
       return;
     }
-    if (e.buttons) return;
-    canvas.style.cursor = hitsPreview(e) ? 'grab' : pickModel(e) ? 'crosshair' : '';
-  });
-  canvas.addEventListener('pointerup', (e) => {
-    if (dragging) {
-      dragging = false;
-      controls.enabled = true;
-      canvas.releasePointerCapture(e.pointerId);
-      canvas.style.cursor = 'grab';
-      scheduleRebuild(0);
-    } else if (down && Math.hypot(e.clientX - down.x, e.clientY - down.y) < 5) {
-      const hit = pickModel(e);
-      if (hit) {
-        placeAt(hit);
-        scheduleRebuild(0);
-      }
+    const err = await spaceMouse.connect();
+    if (err) toast(err, true);
+  };
+  speed.oninput = () => {
+    spaceMouse.settings.speed = Number(speed.value);
+    spaceMouse.saveSettings();
+    refresh();
+  };
+  invRot.onchange = () => {
+    spaceMouse.settings.invertRotation = invRot.checked;
+    spaceMouse.saveSettings();
+  };
+  invTr.onchange = () => {
+    spaceMouse.settings.invertTranslation = invTr.checked;
+    spaceMouse.saveSettings();
+  };
+  refresh();
+  spaceMouse.autoConnect();
+
+  // ⚙ popover in the view toolbar
+  const pop = $('#settingsPop');
+  const toggle = $('#btn-settings');
+  toggle.onclick = (e) => {
+    e.stopPropagation();
+    pop.classList.toggle('on');
+    toggle.classList.toggle('active', pop.classList.contains('on'));
+  };
+  document.addEventListener('pointerdown', (e) => {
+    if (pop.classList.contains('on') && !pop.contains(e.target) && e.target !== toggle) {
+      pop.classList.remove('on');
+      toggle.classList.remove('active');
     }
-    down = null;
   });
 }
 
@@ -865,7 +1099,6 @@ function wireUI() {
 
 async function main() {
   wireUI();
-  setView('iso');
   updateButtons();
   await busy('Loading geometry engine…', async () => {
     await initManifold(() => wasmUrl);
