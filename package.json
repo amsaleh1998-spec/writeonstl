@@ -20,6 +20,7 @@
   },
   "homepage": "https://github.com/amsaleh1998-spec/writeonstl#readme",
   "dependencies": {
+    "fflate": "^0.8.3",
     "manifold-3d": "^3.5.4",
     "opentype.js": "^2.0.0",
     "three": "^0.187.0",

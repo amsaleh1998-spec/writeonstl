@@ -21,8 +21,12 @@
       <section>
         <h2><span class="step">1</span> Model</h2>
         <label class="file-btn primary">
-          <input type="file" id="stlInput" accept=".stl,model/stl" hidden />
+          <input type="file" id="stlInput" accept=".stl,model/stl,.zip" multiple hidden />
           Open STL…
+        </label>
+        <label class="file-btn" title="Open the folder a clear-aligner program exported (one …_Subsetup1, …_Subsetup2, … folder per stage). ZIPs of it work too: use Open STL… or drop them.">
+          <input type="file" id="folderInput" webkitdirectory multiple hidden />
+          Open aligner export folder…
         </label>
         <div class="samples">
           <span>or try:</span>
@@ -31,12 +35,35 @@
           <button data-sample="sphere">Sphere</button>
           <button data-sample="coin">Coin</button>
         </div>
-        <div id="modelInfo" class="info muted">Drop an .stl file anywhere on the page.</div>
+        <div id="modelInfo" class="info muted">Drop an .stl file, an aligner export folder or its ZIPs anywhere on the page.</div>
+      </section>
+
+      <section id="batchSection" class="hidden">
+        <h2><span class="step">A</span> Aligner case <button id="batchClose" class="link" title="Close the aligner case">Close</button></h2>
+        <div class="seg" id="batchJaw" role="group" aria-label="Jaw">
+          <button data-v="upper">Maxillary</button>
+          <button data-v="lower">Mandibular</button>
+        </div>
+        <div class="seg" id="batchKind" role="group" aria-label="Label">
+          <button data-v="number" title="The subsetup number, placed at the same spot on every stage">Number</button>
+          <button data-v="t" title="An extra label on the stage 1 model with attachments">T on attachments</button>
+        </div>
+        <div class="stage-row" id="stageRow">
+          <span>Showing</span>
+          <button id="stagePrev" title="Previous stage" aria-label="Previous stage">‹</button>
+          <select id="stageSelect" aria-label="Stage"></select>
+          <button id="stageNext" title="Next stage" aria-label="Next stage">›</button>
+        </div>
+        <ul id="batchStatus" class="batch-status"></ul>
+        <label class="check-line" title="The stage 1 model with attachments gets the number as well as the T">
+          <input type="checkbox" id="batchNumberAttach" /> Also number the attachment models
+        </label>
       </section>
 
       <section>
         <h2><span class="step">2</span> Text</h2>
         <textarea id="text" rows="2" spellcheck="false">Hello</textarea>
+        <p id="textHint" class="field-hint hidden"></p>
         <div class="row">
           <select id="font" title="Font"></select>
           <label class="file-btn icon" title="Upload your own font (.ttf, .otf, .woff)">
@@ -105,6 +132,7 @@
           <button id="reset" disabled title="Back to the original model">Reset</button>
         </div>
         <button id="export" class="accent" disabled>Download STL</button>
+        <button id="batchProcess" class="accent hidden" disabled>Label all models &amp; download ZIP</button>
       </section>
 
       <footer>Runs entirely in your browser — files never leave your computer.</footer>
