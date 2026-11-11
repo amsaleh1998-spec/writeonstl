@@ -1,0 +1,137 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>WriteOnSTL</title>
+    <meta name="description" content="Add embossed or engraved text to STL files, right in your browser." />
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%23ff7a1a'/%3E%3Ctext x='16' y='23' font-family='Arial' font-weight='900' font-size='19' text-anchor='middle' fill='white'%3EA%3C/text%3E%3C/svg%3E" />
+    <link rel="stylesheet" href="/src/style.css" />
+  </head>
+  <body>
+    <aside id="panel">
+      <header class="brand">
+        <div class="logo">A</div>
+        <div>
+          <h1>WriteOnSTL</h1>
+          <p>Emboss or engrave text on 3D models</p>
+        </div>
+      </header>
+
+      <section>
+        <h2><span class="step">1</span> Model</h2>
+        <label class="file-btn primary">
+          <input type="file" id="stlInput" accept=".stl,model/stl" hidden />
+          Open STL…
+        </label>
+        <div class="samples">
+          <span>or try:</span>
+          <button data-sample="plate">Plate</button>
+          <button data-sample="cylinder">Cylinder</button>
+          <button data-sample="sphere">Sphere</button>
+          <button data-sample="coin">Coin</button>
+        </div>
+        <div id="modelInfo" class="info muted">Drop an .stl file anywhere on the page.</div>
+      </section>
+
+      <section>
+        <h2><span class="step">2</span> Text</h2>
+        <textarea id="text" rows="2" spellcheck="false">Hello</textarea>
+        <div class="row">
+          <select id="font" title="Font"></select>
+          <label class="file-btn icon" title="Upload your own font (.ttf, .otf, .woff)">
+            <input type="file" id="fontInput" accept=".ttf,.otf,.woff" hidden />
+            +
+          </label>
+        </div>
+        <div class="row seg" id="align" role="group" aria-label="Alignment">
+          <button data-v="left" title="Align left">Left</button>
+          <button data-v="center" title="Align centre">Center</button>
+          <button data-v="right" title="Align right">Right</button>
+        </div>
+      </section>
+
+      <section>
+        <h2><span class="step">3</span> Style</h2>
+        <div class="seg big" id="mode" role="group" aria-label="Mode">
+          <button data-v="emboss"><b>Emboss</b><small>raised</small></button>
+          <button data-v="engrave"><b>Engrave</b><small>cut in</small></button>
+        </div>
+
+        <div class="ctl" data-key="height" data-min="1" data-max="100" data-step="0.5" data-unit="mm">
+          <label>Letter height</label>
+        </div>
+        <div class="ctl" data-key="depth" data-min="0.2" data-max="20" data-step="0.1" data-unit="mm">
+          <label id="depthLabel">Thickness</label>
+        </div>
+        <div class="ctl" data-key="weight" data-min="-1" data-max="2" data-step="0.05" data-unit="mm">
+          <label title="Grow or shrink letter outlines">Boldness</label>
+        </div>
+        <div class="ctl" data-key="letterSpacing" data-min="-5" data-max="20" data-step="0.1" data-unit="mm">
+          <label>Letter spacing</label>
+        </div>
+        <div class="ctl" data-key="lineSpacing" data-min="0.8" data-max="4" data-step="0.05" data-unit="×">
+          <label>Line spacing</label>
+        </div>
+        <div class="ctl" data-key="rotation" data-min="-180" data-max="180" data-step="1" data-unit="°">
+          <label>Rotation</label>
+        </div>
+
+        <div class="checks">
+          <label title="Bend the text to follow curved surfaces">
+            <input type="checkbox" id="conform" /> Follow curved surface
+          </label>
+          <label title="Mirror the text (e.g. for stamps, or text read from the other side)">
+            <input type="checkbox" id="mirror" /> Mirror
+          </label>
+        </div>
+
+        <details>
+          <summary>Advanced</summary>
+          <div class="ctl" data-key="embed" data-min="0" data-max="5" data-step="0.05" data-unit="mm">
+            <label title="How far raised text is sunk into the surface so it fuses with the model">Sink into surface</label>
+          </div>
+          <div class="ctl" data-key="quality" data-min="1" data-max="5" data-step="1" data-unit="">
+            <label title="Curve smoothness of the letters">Curve quality</label>
+          </div>
+        </details>
+      </section>
+
+      <section class="actions">
+        <p id="hint" class="hint">Load a model, then click on it to place the text.</p>
+        <button id="apply" class="primary" disabled>Apply text to model</button>
+        <div class="row">
+          <button id="undo" disabled title="Undo (Ctrl+Z)">Undo</button>
+          <button id="reset" disabled title="Back to the original model">Reset</button>
+        </div>
+        <button id="export" class="accent" disabled>Download STL</button>
+      </section>
+
+      <footer>Runs entirely in your browser — files never leave your computer.</footer>
+    </aside>
+
+    <main id="viewport">
+      <canvas id="canvas"></canvas>
+      <div class="toolbar">
+        <button data-view="fit" title="Fit model">Fit</button>
+        <button data-view="iso">Iso</button>
+        <button data-view="top">Top</button>
+        <button data-view="front">Front</button>
+        <button data-view="right">Right</button>
+        <button data-view="bottom">Bottom</button>
+      </div>
+      <div id="empty" class="empty">
+        <div>
+          <div class="big-icon">⬡</div>
+          <p><b>Drop an STL file here</b></p>
+          <p class="muted">or pick a sample model on the left</p>
+        </div>
+      </div>
+      <div id="dropOverlay" class="drop-overlay">Drop STL or font file</div>
+      <div id="busy" class="busy"><div class="spinner"></div><span id="busyText">Working…</span></div>
+      <div id="toast" class="toast"></div>
+    </main>
+
+    <script type="module" src="/src/main.js"></script>
+  </body>
+</html>
