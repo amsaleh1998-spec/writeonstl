@@ -11,7 +11,7 @@ import { parseFont, fontDisplayName, textToContours } from './text.js';
 import { ViewControls } from './viewControls.js';
 import { SpaceMouse } from './spacemouse.js';
 import { unzip, zip } from 'fflate';
-import { parseAlignerFiles, labelText, firstStage, findModel, JAW_LABEL } from './aligner.js';
+import { parseAlignerFiles, labelText, firstStage, findModel, outputName, JAW_LABEL } from './aligner.js';
 
 THREE.Mesh.prototype.raycast = acceleratedRaycast;
 
@@ -958,9 +958,11 @@ async function processBatch() {
         soup = manifoldToSoup(man);
         man.delete();
       }
-      files[m.path] = new Uint8Array(soupToSTL(soup, src.header || 'WriteOnSTL'));
+      // all models side by side, named after the model and its subsetup number
+      let name = outputName(m);
+      for (let k = 2; files[name]; k++) name = outputName(m).replace(/\.stl$/i, ` (${k}).stl`);
+      files[name] = new Uint8Array(soupToSTL(soup, src.header || 'WriteOnSTL'));
     }
-    if (c.xml) files[c.xml.path.replace(/\\/g, '/').split('/').pop()] = new Uint8Array(await c.xml.read());
     $('#busyText').textContent = 'Compressing ZIP…';
     const data = await new Promise((resolve, reject) => zip(files, { level: 6 }, (err, out) => (err ? reject(err) : resolve(out))));
     download(new Blob([data], { type: 'application/zip' }), `${fileSafe(c.name) || 'aligner'}_labelled.zip`);

@@ -49,3 +49,9 @@ assert(c.xml && c.skipped.length === 1, 'xml / skipped');
 assert(parseAlignerFiles([fake('a/b.stl')]) === null, 'plain STL is not a case');
 assert(labelText('{n}', 7) === '7' && labelText('U{n}', 12) === 'U12' && labelText('L', 3) === 'L3', 'labelText');
 console.log('aligner export parsing ok');
+import { outputName } from '../src/aligner.js';
+{
+  const names = c.models.map(outputName).sort().join(' | ');
+  if (names !== 'Mandibular 1.stl | Mandibular 2.stl | Maxillary 1 with attachments.stl | Maxillary 1.stl | Maxillary 10.stl') throw new Error('outputName: ' + names);
+  console.log('aligner output names ok');
+}
